@@ -114,6 +114,10 @@ impl ProxyServer {
         })
     }
 
+    pub fn fronter(&self) -> Arc<DomainFronter> {
+        self.fronter.clone()
+    }
+
     pub async fn run(self) -> Result<(), ProxyError> {
         let http_addr = format!("{}:{}", self.host, self.port);
         let socks_addr = format!("{}:{}", self.host, self.socks5_port);

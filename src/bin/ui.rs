@@ -563,15 +563,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                             return;
                         }
                     };
-                    match DomainFronter::new(&cfg) {
-                        Ok(f) => {
-                            let arc = Arc::new(f);
-                            *fronter_slot2.lock().await = Some(arc);
-                        }
-                        Err(e) => {
-                            push_log(&shared2, &format!("[ui] fronter build failed: {}", e));
-                        }
-                    }
+                    *fronter_slot2.lock().await = Some(server.fronter());
                     {
                         let mut s = shared2.state.lock().unwrap();
                         s.running = true;
