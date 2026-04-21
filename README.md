@@ -37,7 +37,7 @@ This part is unchanged from the original project. Follow @masterking32's guide, 
 
 1. Open <https://script.google.com> with your Google account
 2. **New project**, delete the default code
-3. Copy the contents of [`Code.gs` from the original repo](https://github.com/masterking32/MasterHttpRelayVPN/blob/main/Code.gs) into the editor
+3. Copy the contents of [`Code.gs` from the original repo](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/Code.gs) ([raw link](https://raw.githubusercontent.com/masterking32/MasterHttpRelayVPN/refs/heads/python_testing/Code.gs)) into the editor
 4. **Change** the line `const AUTH_KEY = "..."` to a strong secret only you know
 5. **Deploy → New deployment → Web app**
    - Execute as: **Me**
@@ -155,7 +155,7 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 
 1. به <https://script.google.com> بروید و با اکانت گوگل وارد شوید
 2. **New project** بزنید، کد پیش‌فرض را پاک کنید
-3. محتوای [`Code.gs`](https://github.com/masterking32/MasterHttpRelayVPN/blob/main/Code.gs) را از ریپو اصلی کپی کنید و Paste کنید
+3. محتوای [`Code.gs`](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/Code.gs) ([لینک raw](https://raw.githubusercontent.com/masterking32/MasterHttpRelayVPN/refs/heads/python_testing/Code.gs)) را از ریپو اصلی کپی کنید و Paste کنید
 4. در خط `const AUTH_KEY = "..."` رمز را به یک مقدار قوی و مخصوص خودتان تغییر دهید
 5. **Deploy → New deployment → Web app**
    - Execute as: **Me**
