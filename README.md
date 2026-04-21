@@ -53,6 +53,8 @@ Each archive contains two binaries and a launcher script:
 
 macOS archives also ship `mhrv-rs.app` (in `*-app.zip`) — double-click to launch the UI without a terminal. You'll still need to run the CLI (`mhrv-rs --install-cert`) or `run.command` once to install the CA.
 
+<p align="center"><img src="docs/ui-screenshot.png" alt="mhrv-rs desktop UI showing config form, live traffic stats, Start/Stop/Test buttons, and log panel" width="420"></p>
+
 Linux UI also needs common desktop libraries available: `libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `libx11`, `libgtk-3`. On most desktop distros these are already present; on a headless box install them via your package manager, or just use the CLI.
 
 ## Where things live
