@@ -2,12 +2,13 @@
 
 This folder contains the prebuilt binaries from the latest release, committed directly to the repository for users who cannot reach the GitHub Releases page.
 
-Current version: **v0.8.5**
+Current version: **v0.8.6**
 
 | File | Platform | Contents |
 |---|---|---|
 | `mhrv-rs-linux-amd64.tar.gz` | Linux x86_64 | `mhrv-rs`, `mhrv-rs-ui`, `run.sh` |
 | `mhrv-rs-linux-arm64.tar.gz` | Linux aarch64 | `mhrv-rs`, `run.sh` (CLI only) |
+| `mhrv-rs-raspbian-armhf.tar.gz` | Raspberry Pi / ARMv7 hardfloat | `mhrv-rs`, `run.sh` (CLI only) |
 | `mhrv-rs-macos-amd64.tar.gz` | macOS Intel | `mhrv-rs`, `mhrv-rs-ui`, `run.sh`, `run.command` |
 | `mhrv-rs-macos-amd64-app.zip` | macOS Intel | `mhrv-rs.app` bundle (double-click from Finder) |
 | `mhrv-rs-macos-arm64.tar.gz` | macOS Apple Silicon | `mhrv-rs`, `mhrv-rs-ui`, `run.sh`, `run.command` |
@@ -49,7 +50,7 @@ See the [main README](../README.md) for full setup (Apps Script deployment, conf
 
 این پوشه شامل فایل‌های آخرین نسخه است و مستقیماً در ریپو قرار گرفته برای کاربرانی که به صفحهٔ GitHub Releases دسترسی ندارند.
 
-نسخهٔ فعلی: **v0.8.5**
+نسخهٔ فعلی: **v0.8.6**
 
 ### دانلود از طریق ZIP
 
