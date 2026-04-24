@@ -246,7 +246,23 @@ impl ProxyServer {
         let http_ctx = self.rewrite_ctx.clone();
         let mut http_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
+            // Track every per-client child task in a JoinSet so that when
+            // this accept task is aborted on shutdown, dropping the JoinSet
+            // aborts the children too. Previously children were bare
+            // `tokio::spawn(...)` handles with no ownership — aborting the
+            // parent accept loop stopped taking new connections but left
+            // in-flight ones running with the OLD config. That manifested
+            // as "hitting Stop in the UI doesn't actually stop anything
+            // already running" (issue #99) and as "changing auth_key and
+            // Start doesn't take effect for domains with a live
+            // keep-alive" because the old DomainFronter stayed alive
+            // inside those child tasks.
+            let mut children: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
+                // Opportunistic reap so completed children don't pile up
+                // memory on long-running proxies.
+                while children.try_join_next().is_some() {}
+
                 let (sock, peer) = match http_listener.accept().await {
                     Ok(x) => {
                         fd_exhaust_count = 0;
@@ -261,7 +277,7 @@ impl ProxyServer {
                 let fronter = http_fronter.clone();
                 let mitm = http_mitm.clone();
                 let rewrite_ctx = http_ctx.clone();
-                tokio::spawn(async move {
+                children.spawn(async move {
                     if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx).await {
                         tracing::debug!("http client {} closed: {}", peer, e);
                     }
@@ -274,7 +290,13 @@ impl ProxyServer {
         let socks_ctx = self.rewrite_ctx.clone();
         let mut socks_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
+            // Same pattern as http_task above — JoinSet so shutdown
+            // drops in-flight SOCKS5 clients instead of leaving them to
+            // keep running on the stale config.
+            let mut children: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
+                while children.try_join_next().is_some() {}
+
                 let (sock, peer) = match socks_listener.accept().await {
                     Ok(x) => {
                         fd_exhaust_count = 0;
@@ -289,7 +311,7 @@ impl ProxyServer {
                 let fronter = socks_fronter.clone();
                 let mitm = socks_mitm.clone();
                 let rewrite_ctx = socks_ctx.clone();
-                tokio::spawn(async move {
+                children.spawn(async move {
                     if let Err(e) = handle_socks5_client(sock, fronter, mitm, rewrite_ctx).await {
                         tracing::debug!("socks client {} closed: {}", peer, e);
                     }
