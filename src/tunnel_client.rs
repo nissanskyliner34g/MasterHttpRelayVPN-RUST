@@ -100,6 +100,17 @@ enum MuxMsg {
         data: Vec<u8>,
         reply: oneshot::Sender<Result<TunnelResponse, String>>,
     },
+    UdpOpen {
+        host: String,
+        port: u16,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<TunnelResponse, String>>,
+    },
+    UdpData {
+        sid: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<TunnelResponse, String>>,
+    },
     Close {
         sid: String,
     },
@@ -167,6 +178,47 @@ impl TunnelMux {
         let _ = self.tx.send(msg).await;
     }
 
+    pub async fn udp_open(
+        &self,
+        host: &str,
+        port: u16,
+        data: Vec<u8>,
+    ) -> Result<TunnelResponse, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send(MuxMsg::UdpOpen {
+            host: host.to_string(),
+            port,
+            data,
+            reply: reply_tx,
+        })
+        .await;
+        match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => Err("mux channel closed".into()),
+        }
+    }
+
+    pub async fn udp_data(&self, sid: &str, data: Vec<u8>) -> Result<TunnelResponse, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send(MuxMsg::UdpData {
+            sid: sid.to_string(),
+            data,
+            reply: reply_tx,
+        })
+        .await;
+        match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => Err("mux channel closed".into()),
+        }
+    }
+
+    pub async fn close_session(&self, sid: &str) {
+        self.send(MuxMsg::Close {
+            sid: sid.to_string(),
+        })
+        .await;
+    }
+
     fn connect_data_unsupported(&self) -> bool {
         self.connect_data_unsupported.load(Ordering::Relaxed)
     }
@@ -202,7 +254,11 @@ impl TunnelMux {
 
     fn record_preread_loss(&self, port: u16) {
         self.preread_loss.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!("preread loss: port={} (empty within {:?})", port, CLIENT_FIRST_DATA_WAIT);
+        tracing::debug!(
+            "preread loss: port={} (empty within {:?})",
+            port,
+            CLIENT_FIRST_DATA_WAIT
+        );
         self.maybe_log_preread_summary();
     }
 
@@ -213,7 +269,8 @@ impl TunnelMux {
     }
 
     fn record_preread_skip_unsupported(&self, port: u16) {
-        self.preread_skip_unsupported.fetch_add(1, Ordering::Relaxed);
+        self.preread_skip_unsupported
+            .fetch_add(1, Ordering::Relaxed);
         tracing::debug!("preread skip: port={} (connect_data unsupported)", port);
         self.maybe_log_preread_summary();
     }
@@ -251,7 +308,12 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>) {
         fronter
             .script_id_list()
             .iter()
-            .map(|id| (id.clone(), Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT))))
+            .map(|id| {
+                (
+                    id.clone(),
+                    Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT)),
+                )
+            })
             .collect(),
     );
 
@@ -278,16 +340,25 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>) {
                 MuxMsg::Connect { host, port, reply } => {
                     let f = fronter.clone();
                     tokio::spawn(async move {
-                        let result =
-                            f.tunnel_request("connect", Some(&host), Some(port), None, None)
-                                .await;
+                        let result = f
+                            .tunnel_request("connect", Some(&host), Some(port), None, None)
+                            .await;
                         match result {
-                            Ok(resp) => { let _ = reply.send(Ok(resp)); }
-                            Err(e) => { let _ = reply.send(Err(format!("{}", e))); }
+                            Ok(resp) => {
+                                let _ = reply.send(Ok(resp));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("{}", e)));
+                            }
                         }
                     });
                 }
-                MuxMsg::ConnectData { host, port, data, reply } => {
+                MuxMsg::ConnectData {
+                    host,
+                    port,
+                    data,
+                    reply,
+                } => {
                     let encoded = Some(B64.encode(data.as_slice()));
                     let op_bytes = encoded.as_ref().map(|s| s.len()).unwrap_or(0);
 
@@ -343,6 +414,77 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>) {
                     let idx = data_ops.len();
                     data_ops.push(BatchOp {
                         op: "data".into(),
+                        sid: Some(sid),
+                        host: None,
+                        port: None,
+                        d: encoded,
+                    });
+                    data_replies.push((idx, reply));
+                    batch_payload_bytes += op_bytes;
+                }
+                MuxMsg::UdpOpen {
+                    host,
+                    port,
+                    data,
+                    reply,
+                } => {
+                    let encoded = if data.is_empty() {
+                        None
+                    } else {
+                        Some(B64.encode(&data))
+                    };
+                    let op_bytes = encoded.as_ref().map(|s| s.len()).unwrap_or(0);
+
+                    if !data_ops.is_empty()
+                        && (data_ops.len() >= MAX_BATCH_OPS
+                            || batch_payload_bytes + op_bytes > MAX_BATCH_PAYLOAD_BYTES)
+                    {
+                        fire_batch(
+                            &sems,
+                            &fronter,
+                            std::mem::take(&mut data_ops),
+                            std::mem::take(&mut data_replies),
+                        )
+                        .await;
+                        batch_payload_bytes = 0;
+                    }
+
+                    let idx = data_ops.len();
+                    data_ops.push(BatchOp {
+                        op: "udp_open".into(),
+                        sid: None,
+                        host: Some(host),
+                        port: Some(port),
+                        d: encoded,
+                    });
+                    data_replies.push((idx, reply));
+                    batch_payload_bytes += op_bytes;
+                }
+                MuxMsg::UdpData { sid, data, reply } => {
+                    let encoded = if data.is_empty() {
+                        None
+                    } else {
+                        Some(B64.encode(&data))
+                    };
+                    let op_bytes = encoded.as_ref().map(|s| s.len()).unwrap_or(0);
+
+                    if !data_ops.is_empty()
+                        && (data_ops.len() >= MAX_BATCH_OPS
+                            || batch_payload_bytes + op_bytes > MAX_BATCH_PAYLOAD_BYTES)
+                    {
+                        fire_batch(
+                            &sems,
+                            &fronter,
+                            std::mem::take(&mut data_ops),
+                            std::mem::take(&mut data_replies),
+                        )
+                        .await;
+                        batch_payload_bytes = 0;
+                    }
+
+                    let idx = data_ops.len();
+                    data_ops.push(BatchOp {
+                        op: "udp_data".into(),
                         sid: Some(sid),
                         host: None,
                         port: None,
@@ -514,7 +656,10 @@ pub async fn tunnel_connection(
             match write_tunnel_response(&mut sock, &resp).await? {
                 WriteOutcome::Wrote | WriteOutcome::NoData => {}
                 WriteOutcome::BadBase64 => {
-                    tracing::error!("tunnel session {}: bad base64 in connect_data response", sid);
+                    tracing::error!(
+                        "tunnel session {}: bad base64 in connect_data response",
+                        sid
+                    );
                     return Ok(());
                 }
             }
@@ -636,7 +781,10 @@ async fn connect_with_initial_data(
         ));
     };
 
-    Ok(ConnectDataOutcome::Opened { sid, response: resp })
+    Ok(ConnectDataOutcome::Opened {
+        sid,
+        response: resp,
+    })
 }
 
 /// Decide whether a response indicates the tunnel-node (or apps_script
@@ -834,6 +982,18 @@ where
     }
 }
 
+pub fn decode_udp_packets(resp: &TunnelResponse) -> Result<Vec<Vec<u8>>, String> {
+    let Some(pkts) = resp.pkts.as_ref() else {
+        return Ok(Vec::new());
+    };
+    pkts.iter()
+        .map(|pkt| {
+            B64.decode(pkt)
+                .map_err(|e| format!("bad UDP packet base64: {}", e))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -846,6 +1006,7 @@ mod tests {
         TunnelResponse {
             sid: None,
             d: None,
+            pkts: None,
             eof: None,
             e: e.map(str::to_string),
             code: code.map(str::to_string),
@@ -854,7 +1015,10 @@ mod tests {
 
     #[test]
     fn unsupported_detection_via_structured_code() {
-        assert!(is_connect_data_unsupported_response(&resp_with(Some("UNSUPPORTED_OP"), None)));
+        assert!(is_connect_data_unsupported_response(&resp_with(
+            Some("UNSUPPORTED_OP"),
+            None
+        )));
         assert!(is_connect_data_unsupported_response(&resp_with(
             Some("UNSUPPORTED_OP"),
             Some("unknown op: connect_data"),
@@ -865,10 +1029,12 @@ mod tests {
     fn unsupported_detection_via_legacy_tunnel_node_string() {
         // Pre-change tunnel-node: no code field, bare "unknown op: ...".
         assert!(is_connect_data_unsupported_response(&resp_with(
-            None, Some("unknown op: connect_data"),
+            None,
+            Some("unknown op: connect_data"),
         )));
         assert!(is_connect_data_unsupported_response(&resp_with(
-            None, Some("Unknown Op: CONNECT_DATA"),
+            None,
+            Some("Unknown Op: CONNECT_DATA"),
         )));
     }
 
@@ -878,30 +1044,46 @@ mod tests {
         // This is the realistic skew case — user upgrades tunnel-node + client
         // binary but hasn't redeployed the Apps Script yet.
         assert!(is_connect_data_unsupported_response(&resp_with(
-            None, Some("unknown tunnel op: connect_data"),
+            None,
+            Some("unknown tunnel op: connect_data"),
         )));
     }
 
     #[test]
     fn unsupported_detection_rejects_unrelated_errors() {
         assert!(!is_connect_data_unsupported_response(&resp_with(
-            None, Some("connect failed: refused"),
+            None,
+            Some("connect failed: refused"),
         )));
-        assert!(!is_connect_data_unsupported_response(&resp_with(None, Some("bad base64"))));
-        assert!(!is_connect_data_unsupported_response(&resp_with(None, None)));
+        assert!(!is_connect_data_unsupported_response(&resp_with(
+            None,
+            Some("bad base64")
+        )));
+        assert!(!is_connect_data_unsupported_response(&resp_with(
+            None, None
+        )));
         // "connect_data" alone (without "unknown op") shouldn't trigger.
         assert!(!is_connect_data_unsupported_response(&resp_with(
-            None, Some("connect_data: bad port"),
+            None,
+            Some("connect_data: bad port"),
         )));
     }
 
     #[test]
     fn server_speaks_first_covers_common_protocols() {
         for p in [21u16, 22, 25, 80, 110, 143, 587] {
-            assert!(is_server_speaks_first(p), "port {} should be server-first", p);
+            assert!(
+                is_server_speaks_first(p),
+                "port {} should be server-first",
+                p
+            );
         }
         for p in [443u16, 8443, 853, 993, 1234] {
-            assert!(!is_server_speaks_first(p), "port {} should NOT be server-first", p);
+            assert!(
+                !is_server_speaks_first(p),
+                "port {} should NOT be server-first",
+                p
+            );
         }
     }
 
@@ -947,9 +1129,7 @@ mod tests {
 
         let loop_handle = tokio::spawn({
             let mux = mux.clone();
-            async move {
-                tunnel_loop(&mut server_side, "sid-under-test", &mux, pending).await
-            }
+            async move { tunnel_loop(&mut server_side, "sid-under-test", &mux, pending).await }
         });
 
         // The first message tunnel_loop emits must be Data carrying the
@@ -967,6 +1147,7 @@ mod tests {
                 let _ = reply.send(Ok(TunnelResponse {
                     sid: Some("sid-under-test".into()),
                     d: None,
+                    pkts: None,
                     eof: Some(true),
                     e: None,
                     code: None,
@@ -978,6 +1159,8 @@ mod tests {
                     MuxMsg::Connect { .. } => "Connect",
                     MuxMsg::ConnectData { .. } => "ConnectData",
                     MuxMsg::Data { .. } => unreachable!(),
+                    MuxMsg::UdpOpen { .. } => "UdpOpen",
+                    MuxMsg::UdpData { .. } => "UdpData",
                     MuxMsg::Close { .. } => "Close",
                 }
             ),

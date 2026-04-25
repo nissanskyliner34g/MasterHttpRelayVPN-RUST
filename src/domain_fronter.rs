@@ -181,6 +181,9 @@ pub struct TunnelResponse {
     pub sid: Option<String>,
     #[serde(default)]
     pub d: Option<String>,
+    /// UDP datagrams returned by tunnel-node, base64-encoded individually.
+    #[serde(default)]
+    pub pkts: Option<Vec<String>>,
     #[serde(default)]
     pub eof: Option<bool>,
     #[serde(default)]

@@ -1,20 +1,23 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::rustls::server::Acceptor;
+use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 
 use crate::config::{Config, Mode};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
-use crate::tunnel_client::TunnelMux;
+use crate::tunnel_client::{decode_udp_packets, TunnelMux};
 
 // Domains that are served from Google's core frontend IP pool and therefore
 // respond correctly when we connect to `google_ip` with SNI=`front_domain`
@@ -182,9 +185,8 @@ impl ProxyServer {
         // `script_id`, which is exactly the state a bootstrapping user is in.
         let fronter = match mode {
             Mode::AppsScript | Mode::Full => {
-                let f = DomainFronter::new(config).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("{e}"))
-                })?;
+                let f = DomainFronter::new(config)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
                 Some(Arc::new(f))
             }
             Mode::GoogleOnly => None,
@@ -320,7 +322,8 @@ impl ProxyServer {
                 let rewrite_ctx = http_ctx.clone();
                 let mux = http_mux.clone();
                 children.spawn(async move {
-                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx, mux).await {
+                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx, mux).await
+                    {
                         tracing::debug!("http client {} closed: {}", peer, e);
                     }
                 });
@@ -356,7 +359,9 @@ impl ProxyServer {
                 let rewrite_ctx = socks_ctx.clone();
                 let mux = socks_mux.clone();
                 children.spawn(async move {
-                    if let Err(e) = handle_socks5_client(sock, fronter, mitm, rewrite_ctx, mux).await {
+                    if let Err(e) =
+                        handle_socks5_client(sock, fronter, mitm, rewrite_ctx, mux).await
+                    {
                         tracing::debug!("socks client {} closed: {}", peer, e);
                     }
                 });
@@ -510,8 +515,8 @@ async fn handle_socks5_client(
         return Ok(());
     }
     let cmd = req[1];
-    if cmd != 0x01 {
-        // CONNECT only.
+    if cmd != 0x01 && cmd != 0x03 {
+        // CONNECT and UDP ASSOCIATE only.
         sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await?;
         return Ok(());
@@ -546,6 +551,11 @@ async fn handle_socks5_client(
     sock.read_exact(&mut port_buf).await?;
     let port = u16::from_be_bytes(port_buf);
 
+    if cmd == 0x03 {
+        tracing::info!("SOCKS5 UDP ASSOCIATE requested for {}:{}", host, port);
+        return handle_socks5_udp_associate(sock, rewrite_ctx, tunnel_mux).await;
+    }
+
     tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);
 
     // Success reply with zeroed BND.
@@ -554,6 +564,372 @@ async fn handle_socks5_client(
     sock.flush().await?;
 
     dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SocksUdpTarget {
+    host: String,
+    port: u16,
+    atyp: u8,
+    addr: Vec<u8>,
+}
+
+/// Per-target relay session state shared between the dispatch loop and
+/// the per-session task. The dispatch loop pushes uplink datagrams via
+/// `uplink`; the task drains the upstream and serializes both directions
+/// onto a single tunnel-mux call at a time.
+struct UdpRelaySession {
+    uplink: mpsc::Sender<Vec<u8>>,
+}
+
+/// SOCKS5 UDP request frame: 4-byte header + atyp-specific address + 2-byte
+/// port + payload. DOMAIN atyp uses a 1-byte length prefix + up to 255
+/// bytes, so the largest header is `4 + 1 + 255 + 2 = 262`. Round to 300
+/// for safety; payload itself can be a full 64 KB datagram.
+const SOCKS5_UDP_RECV_BUF_BYTES: usize = 65535 + 300;
+
+/// Bound on per-session uplink queue depth. UDP is lossy by design — if
+/// the per-session task can't keep up, drop the newest datagram (caller
+/// uses `try_send`) instead of stalling the whole UDP relay loop.
+const UDP_UPLINK_QUEUE: usize = 64;
+
+/// Initial poll spacing when a session is idle. Tunnel-node already
+/// long-polls each empty `udp_data` for up to 5 s, so this is a
+/// client-side floor — bursts of upstream packets reset back to this.
+const UDP_INITIAL_POLL_DELAY: Duration = Duration::from_millis(500);
+
+/// Cap on the exponential backoff for an idle session. After this many
+/// seconds of zero traffic in either direction, polls happen at most
+/// once per `UDP_MAX_POLL_DELAY` plus the tunnel-node long-poll window —
+/// so an idle UDP destination costs roughly one batch slot every 35 s.
+const UDP_MAX_POLL_DELAY: Duration = Duration::from_secs(30);
+
+async fn handle_socks5_udp_associate(
+    mut control: TcpStream,
+    rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
+) -> std::io::Result<()> {
+    if rewrite_ctx.mode != Mode::Full {
+        tracing::debug!("UDP ASSOCIATE rejected: only full mode supports UDP tunneling");
+        write_socks5_reply(&mut control, 0x07, None).await?;
+        return Ok(());
+    }
+    let Some(mux) = tunnel_mux else {
+        tracing::debug!("UDP ASSOCIATE rejected: full mode has no tunnel mux");
+        write_socks5_reply(&mut control, 0x01, None).await?;
+        return Ok(());
+    };
+
+    // Per RFC 1928 §6 the UDP relay only accepts datagrams from the
+    // SOCKS5 client. We pin the source IP to the control TCP peer up
+    // front so a third party on the bind interface can't hijack the
+    // session by sending the first datagram.
+    let client_peer_ip = control.peer_addr()?.ip();
+
+    // The local TUN bridge talks to us over loopback. Binding the UDP relay
+    // there avoids exposing an unauthenticated UDP socket on LAN interfaces.
+    let bind_ip = match control.local_addr()?.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ip => ip,
+    };
+    let udp = Arc::new(UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?);
+    write_socks5_reply(&mut control, 0x00, Some(udp.local_addr()?)).await?;
+    tracing::info!(
+        "SOCKS5 UDP relay bound on {} for client {}",
+        udp.local_addr()?,
+        client_peer_ip
+    );
+
+    let mut buf = vec![0u8; SOCKS5_UDP_RECV_BUF_BYTES];
+    let mut control_buf = [0u8; 1];
+    let mut client_addr: Option<SocketAddr> = None;
+    let sessions: Arc<Mutex<HashMap<SocksUdpTarget, UdpRelaySession>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    loop {
+        tokio::select! {
+            recv = udp.recv_from(&mut buf) => {
+                let (n, peer) = match recv {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("udp associate recv failed: {}", e);
+                        break;
+                    }
+                };
+                // Source-IP check: anything not from the SOCKS5 client's
+                // host is dropped silently. After the first valid packet,
+                // also lock to its source port (RFC 1928 §6).
+                if peer.ip() != client_peer_ip {
+                    continue;
+                }
+                if let Some(existing) = client_addr {
+                    if existing != peer {
+                        continue;
+                    }
+                } else {
+                    tracing::info!("UDP relay locked to client {}", peer);
+                    client_addr = Some(peer);
+                }
+
+                let Some((target, payload)) = parse_socks5_udp_packet(&buf[..n]) else {
+                    continue;
+                };
+                let payload = payload.to_vec();
+
+                // Fast path: existing session — push payload onto its
+                // bounded uplink queue, drop on overflow (UDP semantics).
+                {
+                    let sess = sessions.lock().await;
+                    if let Some(session) = sess.get(&target) {
+                        let _ = session.uplink.try_send(payload);
+                        continue;
+                    }
+                }
+
+                // New target: open via tunnel-node and spawn the per-session
+                // task. The first datagram rides the udp_open op so we
+                // save one round trip on session establishment.
+                let resp = match mux.udp_open(&target.host, target.port, payload).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(
+                            "udp open {}:{} failed: {}",
+                            target.host, target.port, e
+                        );
+                        continue;
+                    }
+                };
+                if let Some(ref e) = resp.e {
+                    tracing::debug!("udp open {}:{} failed: {}", target.host, target.port, e);
+                    continue;
+                }
+                let Some(sid) = resp.sid.clone() else {
+                    tracing::debug!(
+                        "udp open {}:{} returned no sid",
+                        target.host, target.port
+                    );
+                    continue;
+                };
+                send_udp_response_packets(&udp, peer, &target, &resp).await;
+
+                let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>(UDP_UPLINK_QUEUE);
+                let task_mux = mux.clone();
+                let task_udp = udp.clone();
+                let task_target = target.clone();
+                let task_sessions = sessions.clone();
+                let task_sid = sid.clone();
+                tokio::spawn(async move {
+                    udp_session_task(
+                        task_mux,
+                        task_udp,
+                        task_sid,
+                        task_target.clone(),
+                        peer,
+                        uplink_rx,
+                    )
+                    .await;
+                    // On exit (eof / mux error / channel close) remove
+                    // ourselves from the dispatch map so a future packet
+                    // to the same target opens a fresh tunnel-node session.
+                    task_sessions.lock().await.remove(&task_target);
+                });
+
+                sessions
+                    .lock()
+                    .await
+                    .insert(target, UdpRelaySession { uplink: uplink_tx });
+            }
+            read = control.read(&mut control_buf) => {
+                match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
+
+    // Drop every uplink Sender. Each per-session task observes its
+    // receiver close, breaks out of select!, and issues close_session
+    // on the tunnel-node before exiting.
+    sessions.lock().await.clear();
+    Ok(())
+}
+
+/// Per-target relay task. Owns one tunnel-node UDP session and shuttles
+/// datagrams in both directions through a single in-flight tunnel call
+/// at a time. Two cancellation points:
+///   * `uplink_rx.recv()` returns `None` when the dispatch loop drops
+///     the matching `Sender` (SOCKS5 client gone, or session evicted).
+///   * `mux.udp_data` returns eof / error when the tunnel-node session
+///     is reaped or the target is unreachable.
+async fn udp_session_task(
+    mux: Arc<TunnelMux>,
+    udp: Arc<UdpSocket>,
+    sid: String,
+    target: SocksUdpTarget,
+    client_addr: SocketAddr,
+    mut uplink_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    let mut backoff = UDP_INITIAL_POLL_DELAY;
+    loop {
+        // `biased;` prefers uplink so an active client doesn't get
+        // shadowed by a long sleep. Both branches are cancel-safe.
+        let resp = tokio::select! {
+            biased;
+            uplink = uplink_rx.recv() => {
+                let Some(payload) = uplink else { break; };
+                // Active uplink — reset the empty-poll backoff so the
+                // next inbound poll happens promptly.
+                backoff = UDP_INITIAL_POLL_DELAY;
+                match mux.udp_data(&sid, payload).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("udp data {} failed: {}", sid, e);
+                        break;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(backoff) => {
+                match mux.udp_data(&sid, Vec::new()).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("udp poll {} failed: {}", sid, e);
+                        break;
+                    }
+                }
+            }
+        };
+        if resp.e.is_some() || resp.eof.unwrap_or(false) {
+            break;
+        }
+        let got_pkts = resp.pkts.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+        if got_pkts {
+            send_udp_response_packets(&udp, client_addr, &target, &resp).await;
+            backoff = UDP_INITIAL_POLL_DELAY;
+        } else {
+            // Empty poll — back off so an idle destination doesn't
+            // monopolize batch slots.
+            backoff = (backoff * 2).min(UDP_MAX_POLL_DELAY);
+        }
+    }
+    // Be polite even if the session is already gone server-side; the
+    // tunnel-node tolerates close on an unknown sid.
+    mux.close_session(&sid).await;
+}
+
+async fn send_udp_response_packets(
+    udp: &UdpSocket,
+    client_addr: SocketAddr,
+    target: &SocksUdpTarget,
+    resp: &crate::domain_fronter::TunnelResponse,
+) {
+    let packets = match decode_udp_packets(resp) {
+        Ok(packets) => packets,
+        Err(e) => {
+            tracing::debug!("{}", e);
+            return;
+        }
+    };
+    for packet in packets {
+        let framed = build_socks5_udp_packet(target, &packet);
+        let _ = udp.send_to(&framed, client_addr).await;
+    }
+}
+
+async fn write_socks5_reply(
+    sock: &mut TcpStream,
+    rep: u8,
+    addr: Option<SocketAddr>,
+) -> std::io::Result<()> {
+    let mut out = vec![0x05, rep, 0x00];
+    match addr {
+        Some(SocketAddr::V4(v4)) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.ip().octets());
+            out.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        Some(SocketAddr::V6(v6)) => {
+            out.push(0x04);
+            out.extend_from_slice(&v6.ip().octets());
+            out.extend_from_slice(&v6.port().to_be_bytes());
+        }
+        None => {
+            out.push(0x01);
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            out.extend_from_slice(&0u16.to_be_bytes());
+        }
+    }
+    sock.write_all(&out).await?;
+    sock.flush().await
+}
+
+fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(SocksUdpTarget, &[u8])> {
+    if buf.len() < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0 {
+        return None;
+    }
+    let atyp = buf[3];
+    let mut pos = 4usize;
+    let (host, addr) = match atyp {
+        0x01 => {
+            if buf.len() < pos + 4 + 2 {
+                return None;
+            }
+            let addr = buf[pos..pos + 4].to_vec();
+            pos += 4;
+            let ip = std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
+            (ip.to_string(), addr)
+        }
+        0x03 => {
+            if buf.len() < pos + 1 {
+                return None;
+            }
+            let len = buf[pos] as usize;
+            pos += 1;
+            if len == 0 || buf.len() < pos + len + 2 {
+                return None;
+            }
+            let addr = buf[pos..pos + len].to_vec();
+            pos += len;
+            (String::from_utf8_lossy(&addr).into_owned(), addr)
+        }
+        0x04 => {
+            if buf.len() < pos + 16 + 2 {
+                return None;
+            }
+            let addr = buf[pos..pos + 16].to_vec();
+            pos += 16;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&addr);
+            (std::net::Ipv6Addr::from(octets).to_string(), addr)
+        }
+        _ => return None,
+    };
+    let port = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    pos += 2;
+    Some((
+        SocksUdpTarget {
+            host,
+            port,
+            atyp,
+            addr,
+        },
+        &buf[pos..],
+    ))
+}
+
+fn build_socks5_udp_packet(target: &SocksUdpTarget, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + target.addr.len() + 2 + payload.len() + 1);
+    out.extend_from_slice(&[0, 0, 0, target.atyp]);
+    match target.atyp {
+        0x03 => {
+            out.push(target.addr.len() as u8);
+            out.extend_from_slice(&target.addr);
+        }
+        _ => out.extend_from_slice(&target.addr),
+    }
+    out.extend_from_slice(&target.port.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
 }
 
 // ---------- Smart dispatch (used by both HTTP CONNECT and SOCKS5) ----------
@@ -613,15 +989,13 @@ async fn dispatch_tunnel(
             None => {
                 tracing::error!(
                     "dispatch {}:{} -> full mode but no tunnel mux (should not happen)",
-                    host, port
+                    host,
+                    port
                 );
                 return Ok(());
             }
         };
-        tracing::info!(
-            "dispatch {}:{} -> full tunnel (via batch mux)",
-            host, port
-        );
+        tracing::info!("dispatch {}:{} -> full tunnel (via batch mux)", host, port);
         crate::tunnel_client::tunnel_connection(sock, &host, port, &mux).await?;
         return Ok(());
     }
@@ -634,7 +1008,11 @@ async fn dispatch_tunnel(
         port,
         rewrite_ctx.youtube_via_relay,
     ) {
-        tracing::info!("dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)", host, port);
+        tracing::info!(
+            "dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)",
+            host,
+            port
+        );
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }
 
@@ -775,11 +1153,8 @@ async fn plain_tcp_passthrough(
                     port,
                     e
                 );
-                match tokio::time::timeout(
-                    connect_timeout,
-                    TcpStream::connect((target_host, port)),
-                )
-                .await
+                match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port)))
+                    .await
                 {
                     Ok(Ok(s)) => s,
                     _ => return,
@@ -787,12 +1162,7 @@ async fn plain_tcp_passthrough(
             }
         }
     } else {
-        match tokio::time::timeout(
-            connect_timeout,
-            TcpStream::connect((target_host, port)),
-        )
-        .await
-        {
+        match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port))).await {
             Ok(Ok(s)) => {
                 tracing::info!("plain-tcp passthrough -> {}:{}", host, port);
                 s
@@ -804,7 +1174,8 @@ async fn plain_tcp_passthrough(
             Err(_) => {
                 tracing::debug!(
                     "plain-tcp connect {}:{} timeout (likely blocked; client should rotate)",
-                    host, port
+                    host,
+                    port
                 );
                 return;
             }
@@ -1283,13 +1654,14 @@ where
     // subdomain of x.com here.
     let host_lower = host.to_ascii_lowercase();
     let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com");
-    let path = if is_x_com
-        && path.starts_with("/i/api/graphql/")
-        && path.contains("?variables=")
-    {
+    let path = if is_x_com && path.starts_with("/i/api/graphql/") && path.contains("?variables=") {
         match path.split_once('&') {
             Some((short, _)) => {
-                tracing::debug!("x.com graphql URL truncated: {} chars -> {}", path.len(), short.len());
+                tracing::debug!(
+                    "x.com graphql URL truncated: {} chars -> {}",
+                    path.len(),
+                    short.len()
+                );
                 short.to_string()
             }
             None => path,
@@ -1358,7 +1730,9 @@ where
     // relay path — range semantics on mutating requests are undefined
     // and would break form submissions.
     let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
-        fronter.relay_parallel_range(&method, &url, &headers, &body).await
+        fronter
+            .relay_parallel_range(&method, &url, &headers, &body)
+            .await
     } else {
         fronter.relay(&method, &url, &headers, &body).await
     };
@@ -1609,7 +1983,9 @@ async fn do_plain_http(
     // mirrors, video poster streams, etc.) need the same acceleration
     // or the relay stalls per-chunk.
     let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
-        fronter.relay_parallel_range(&method, &url, &headers, &body).await
+        fronter
+            .relay_parallel_range(&method, &url, &headers, &body)
+            .await
     } else {
         fronter.relay(&method, &url, &headers, &body).await
     };
@@ -1628,6 +2004,73 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn socks5_udp_domain_packet_round_trips() {
+        let mut raw = vec![0, 0, 0, 0x03, 11];
+        raw.extend_from_slice(b"example.com");
+        raw.extend_from_slice(&3478u16.to_be_bytes());
+        raw.extend_from_slice(b"hello");
+
+        let (target, payload) = parse_socks5_udp_packet(&raw).unwrap();
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 3478);
+        assert_eq!(payload, b"hello");
+        assert_eq!(build_socks5_udp_packet(&target, payload), raw);
+    }
+
+    #[test]
+    fn socks5_udp_rejects_fragmented_packets() {
+        let raw = [0, 0, 1, 0x01, 127, 0, 0, 1, 0x13, 0x8a, b'x'];
+        assert!(parse_socks5_udp_packet(&raw).is_none());
+    }
+
+    #[test]
+    fn socks5_udp_rejects_truncated_inputs() {
+        // Header alone is not enough.
+        assert!(parse_socks5_udp_packet(&[0, 0, 0, 0x01]).is_none());
+        // IPv4 with truncated address bytes (need 4 octets).
+        assert!(parse_socks5_udp_packet(&[0, 0, 0, 0x01, 127, 0, 0]).is_none());
+        // IPv4 with no port.
+        assert!(parse_socks5_udp_packet(&[0, 0, 0, 0x01, 127, 0, 0, 1]).is_none());
+        // DOMAIN with zero-length.
+        assert!(parse_socks5_udp_packet(&[0, 0, 0, 0x03, 0, 0, 80]).is_none());
+        // DOMAIN with length exceeding remaining buffer.
+        assert!(parse_socks5_udp_packet(&[0, 0, 0, 0x03, 5, b'a', b'b']).is_none());
+        // Unknown atyp.
+        assert!(parse_socks5_udp_packet(&[0, 0, 0, 0x09, 1, 2, 3, 4]).is_none());
+        // IPv6 with truncated address.
+        let raw = [0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 11 bytes < 16
+        assert!(parse_socks5_udp_packet(&raw).is_none());
+    }
+
+    #[test]
+    fn socks5_udp_ipv4_round_trips() {
+        let mut raw = vec![0, 0, 0, 0x01, 1, 2, 3, 4];
+        raw.extend_from_slice(&53u16.to_be_bytes());
+        raw.extend_from_slice(b"\x00\x01");
+
+        let (target, payload) = parse_socks5_udp_packet(&raw).unwrap();
+        assert_eq!(target.host, "1.2.3.4");
+        assert_eq!(target.port, 53);
+        assert_eq!(payload, b"\x00\x01");
+        assert_eq!(build_socks5_udp_packet(&target, payload), raw);
+    }
+
+    #[test]
+    fn socks5_udp_ipv6_round_trips() {
+        let mut raw = vec![0, 0, 0, 0x04];
+        raw.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
+        raw.extend_from_slice(&443u16.to_be_bytes());
+        raw.extend_from_slice(b"q");
+        let (target, payload) = parse_socks5_udp_packet(&raw).unwrap();
+        assert_eq!(target.host, "2001:db8::1");
+        assert_eq!(target.port, 443);
+        assert_eq!(payload, b"q");
+        assert_eq!(build_socks5_udp_packet(&target, payload), raw);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1689,8 +2132,18 @@ mod tests {
 
         assert!(should_use_sni_rewrite(&hosts, "google.com", 443, false));
         assert!(!should_use_sni_rewrite(&hosts, "google.com", 80, false));
-        assert!(should_use_sni_rewrite(&hosts, "www.example.com", 443, false));
-        assert!(!should_use_sni_rewrite(&hosts, "www.example.com", 80, false));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "www.example.com",
+            443,
+            false
+        ));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "www.example.com",
+            80,
+            false
+        ));
     }
 
     #[test]
@@ -1702,17 +2155,32 @@ mod tests {
         let hosts = std::collections::HashMap::new();
 
         // Default behaviour: everything in the pool rewrites.
-        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            false
+        ));
         assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false));
 
         // With the toggle on: YouTube opts out, Google stays.
-        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            true
+        ));
         assert!(!should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
         assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
         assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true));
-        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "fonts.gstatic.com",
+            443,
+            true
+        ));
     }
 
     #[test]
@@ -1723,7 +2191,12 @@ mod tests {
         let mut hosts = std::collections::HashMap::new();
         hosts.insert("rr4.googlevideo.com".to_string(), "1.2.3.4".to_string());
 
-        assert!(should_use_sni_rewrite(&hosts, "rr4.googlevideo.com", 443, true));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "rr4.googlevideo.com",
+            443,
+            true
+        ));
     }
 
     #[test]

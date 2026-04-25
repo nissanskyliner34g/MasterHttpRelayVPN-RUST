@@ -9,8 +9,8 @@
 //!   TUNNEL_AUTH_KEY — shared secret (required)
 //!   PORT           — listen port (default 8080, Cloud Run sets this)
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinSet;
 
@@ -76,6 +76,21 @@ const STRAGGLER_SETTLE: Duration = Duration::from_millis(30);
 /// Script's UrlFetch ceiling (~60 s).
 const LONGPOLL_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Bound on each UDP session's inbound queue. Beyond this we drop oldest
+/// to keep recent voice/media packets moving — a stale RTP frame is
+/// worse than a missing one. Sized so a 256-deep queue at typical 1500B
+/// payloads is ~384 KB before backpressure kicks in.
+const UDP_QUEUE_LIMIT: usize = 256;
+
+/// Receive buffer for the UDP reader task. Must be ≥ 65535 to handle
+/// a maximum-size IPv4 datagram without truncation.
+const UDP_RECV_BUF_BYTES: usize = 65536;
+
+/// First queue-drop on a session always logs at warn level; subsequent
+/// drops log at debug only every Nth occurrence so a single congested
+/// session can't flood the operator's log.
+const UDP_QUEUE_DROP_LOG_STRIDE: u64 = 100;
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -94,6 +109,28 @@ struct SessionInner {
 
 struct ManagedSession {
     inner: Arc<SessionInner>,
+    reader_handle: tokio::task::JoinHandle<()>,
+}
+
+/// UDP equivalent of `SessionInner`. Holds a *connected* `UdpSocket`
+/// pinned to one `(host, port)` upstream so we don't have to re-resolve
+/// or re-parse the destination on every datagram. `notify` is fired by
+/// the reader task on each inbound datagram (or on socket error) so the
+/// batch drain phase can wake without polling — same primitive as the
+/// TCP path.
+struct UdpSessionInner {
+    socket: Arc<UdpSocket>,
+    packets: Mutex<VecDeque<Vec<u8>>>,
+    last_active: Mutex<Instant>,
+    notify: Notify,
+    /// Total datagrams dropped because the queue hit `UDP_QUEUE_LIMIT`.
+    /// Surfaced via tracing so operators can correlate "choppy call"
+    /// reports with relay backpressure.
+    queue_drops: AtomicU64,
+}
+
+struct ManagedUdpSession {
+    inner: Arc<UdpSessionInner>,
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -146,6 +183,78 @@ async fn reader_task(mut reader: OwnedReadHalf, session: Arc<SessionInner>) {
                 session.notify.notify_one();
                 break;
             }
+        }
+    }
+}
+
+async fn create_udp_session(host: &str, port: u16) -> std::io::Result<ManagedUdpSession> {
+    let mut addrs = lookup_host((host, port)).await?;
+    let remote = addrs.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no UDP address resolved",
+        )
+    })?;
+    let bind_addr = if remote.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(remote).await?;
+    let socket = Arc::new(socket);
+
+    let inner = Arc::new(UdpSessionInner {
+        socket: socket.clone(),
+        packets: Mutex::new(VecDeque::with_capacity(UDP_QUEUE_LIMIT)),
+        last_active: Mutex::new(Instant::now()),
+        notify: Notify::new(),
+        queue_drops: AtomicU64::new(0),
+    });
+
+    let inner_ref = inner.clone();
+    let reader_handle = tokio::spawn(udp_reader_task(socket, inner_ref));
+    Ok(ManagedUdpSession {
+        inner,
+        reader_handle,
+    })
+}
+
+/// UDP analogue of `reader_task`. Reads from the connected UDP socket
+/// and queues each datagram on the session. Drops oldest on overflow,
+/// updates `last_active` so server-push (download-only) UDP keeps the
+/// session out of the idle reaper, and fires `notify` so the batch
+/// drain phase can wake without polling.
+async fn udp_reader_task(socket: Arc<UdpSocket>, session: Arc<UdpSessionInner>) {
+    let mut buf = vec![0u8; UDP_RECV_BUF_BYTES];
+    loop {
+        match socket.recv(&mut buf).await {
+            // Empty datagram is valid UDP; nothing to forward, ignore.
+            Ok(0) => {}
+            Ok(n) => {
+                let mut packets = session.packets.lock().await;
+                if packets.len() >= UDP_QUEUE_LIMIT {
+                    packets.pop_front();
+                    let dropped = session.queue_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                    if dropped == 1 {
+                        tracing::warn!(
+                            "udp queue full ({}); dropping oldest. Apps Script polling cannot keep up with upstream rate.",
+                            UDP_QUEUE_LIMIT
+                        );
+                    } else if dropped % UDP_QUEUE_DROP_LOG_STRIDE == 0 {
+                        tracing::debug!("udp queue drops: {} on session", dropped);
+                    }
+                }
+                packets.push_back(buf[..n].to_vec());
+                drop(packets);
+                // Inbound packet counts as activity — keeps server-push
+                // UDP (e.g. SIP/RTP, server-sent telemetry) out of the
+                // idle reaper. Empty `udp_data` polls deliberately do
+                // NOT bump this (see batch handler).
+                *session.last_active.lock().await = Instant::now();
+                session.notify.notify_one();
+            }
+            Err(_) => break,
         }
     }
 }
@@ -252,6 +361,61 @@ async fn is_any_drainable(inners: &[Arc<SessionInner>]) -> bool {
     false
 }
 
+/// Drain whatever UDP datagrams are currently queued — no waiting.
+async fn drain_udp_now(session: &UdpSessionInner) -> Vec<Vec<u8>> {
+    let mut packets = session.packets.lock().await;
+    packets.drain(..).collect()
+}
+
+/// UDP analogue of `wait_for_any_drainable`. Wakes when any session has
+/// at least one queued packet. Same race-safety contract: watchers
+/// self-filter against observable state to ignore stale permits.
+async fn wait_for_any_udp_drainable(inners: &[Arc<UdpSessionInner>], deadline: Duration) {
+    if inners.is_empty() {
+        return;
+    }
+
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+    let mut watchers = Vec::with_capacity(inners.len());
+    for inner in inners {
+        let inner = inner.clone();
+        let tx = tx.clone();
+        watchers.push(tokio::spawn(async move {
+            loop {
+                inner.notify.notified().await;
+                if !inner.packets.lock().await.is_empty() {
+                    break;
+                }
+                // Stale permit — packets were already drained by a
+                // prior batch. Loop back, don't wake the caller.
+            }
+            let _ = tx.try_send(());
+        }));
+    }
+    drop(tx);
+
+    let already_ready = is_any_udp_drainable(inners).await;
+    if !already_ready {
+        tokio::select! {
+            _ = rx.recv() => {}
+            _ = tokio::time::sleep(deadline) => {}
+        }
+    }
+
+    for w in &watchers {
+        w.abort();
+    }
+}
+
+async fn is_any_udp_drainable(inners: &[Arc<UdpSessionInner>]) -> bool {
+    for inner in inners {
+        if !inner.packets.lock().await.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Wait for response data with drain window. Used by single-op mode.
 async fn wait_and_drain(session: &SessionInner, max_wait: Duration) -> (Vec<u8>, bool) {
     let deadline = Instant::now() + max_wait;
@@ -288,6 +452,7 @@ async fn wait_and_drain(session: &SessionInner, max_wait: Duration) -> (Vec<u8>,
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
+    udp_sessions: Arc<Mutex<HashMap<String, ManagedUdpSession>>>,
     auth_key: String,
 }
 
@@ -309,6 +474,10 @@ struct TunnelRequest {
 struct TunnelResponse {
     #[serde(skip_serializing_if = "Option::is_none")] sid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] d: Option<String>,
+    /// UDP datagrams returned to the client, base64-encoded individually.
+    /// `None` for TCP responses; `Some(vec![])` is never serialized
+    /// (the field is dropped when empty by the empty-on-None check above).
+    #[serde(skip_serializing_if = "Option::is_none")] pkts: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")] eof: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] e: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] code: Option<String>,
@@ -316,11 +485,11 @@ struct TunnelResponse {
 
 impl TunnelResponse {
     fn error(msg: impl Into<String>) -> Self {
-        Self { sid: None, d: None, eof: None, e: Some(msg.into()), code: None }
+        Self { sid: None, d: None, pkts: None, eof: None, e: Some(msg.into()), code: None }
     }
     fn unsupported_op(op: &str) -> Self {
         Self {
-            sid: None, d: None, eof: None,
+            sid: None, d: None, pkts: None, eof: None,
             e: Some(format!("unknown op: {}", op)),
             code: Some(CODE_UNSUPPORTED_OP.into()),
         }
@@ -429,16 +598,18 @@ async fn handle_batch(
     // still fires from server-speaks-first ports and from the preread
     // timeout fallback path.
     let mut results: Vec<(usize, TunnelResponse)> = Vec::with_capacity(req.ops.len());
-    let mut data_ops: Vec<(usize, String)> = Vec::new(); // (index, sid) for data ops needing drain
+    let mut tcp_drains: Vec<(usize, String)> = Vec::new();
+    let mut udp_drains: Vec<(usize, String)> = Vec::new();
     // True iff the batch contained any op that performed a real action
     // upstream — a new connection or a non-empty data write. A batch of
-    // only empty "data" polls (and possibly closes) leaves this false and
-    // qualifies for long-poll behavior in phase 2.
+    // only empty "data" / "udp_data" polls (and possibly closes) leaves
+    // this false and qualifies for long-poll behavior in phase 2.
     let mut had_writes_or_connects = false;
 
     enum NewConn {
         Connect(TunnelResponse),
         ConnectData(Result<String, TunnelResponse>),
+        UdpOpen(Result<String, TunnelResponse>),
     }
     let mut new_conn_jobs: JoinSet<(usize, NewConn)> = JoinSet::new();
 
@@ -470,6 +641,19 @@ async fn handle_batch(
                     (i, NewConn::ConnectData(r))
                 });
             }
+            "udp_open" => {
+                had_writes_or_connects = true;
+                let state = state.clone();
+                let host = op.host.clone();
+                let port = op.port;
+                let d = op.d.clone();
+                new_conn_jobs.spawn(async move {
+                    let r = handle_udp_open_phase1(&state, host, port, d)
+                        .await
+                        .map(|(sid, _inner)| sid);
+                    (i, NewConn::UdpOpen(r))
+                });
+            }
             "data" => {
                 let sid = match &op.sid {
                     Some(s) if !s.is_empty() => s.clone(),
@@ -493,12 +677,53 @@ async fn handle_batch(
                         }
                     }
                     drop(sessions);
-                    data_ops.push((i, sid));
+                    tcp_drains.push((i, sid));
                 } else {
                     drop(sessions);
-                    results.push((i, TunnelResponse {
-                        sid: Some(sid), d: None, eof: Some(true), e: None, code: None,
-                    }));
+                    results.push((i, eof_response(sid)));
+                }
+            }
+            "udp_data" => {
+                let sid = match &op.sid {
+                    Some(s) if !s.is_empty() => s.clone(),
+                    _ => { results.push((i, TunnelResponse::error("missing sid"))); continue; }
+                };
+
+                let inner = {
+                    let sessions = state.udp_sessions.lock().await;
+                    sessions.get(&sid).map(|s| s.inner.clone())
+                };
+                if let Some(inner) = inner {
+                    let mut had_uplink = false;
+                    if let Some(ref data_b64) = op.d {
+                        if !data_b64.is_empty() {
+                            let bytes = match B64.decode(data_b64) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    results.push((
+                                        i,
+                                        TunnelResponse::error(format!("bad base64: {}", e)),
+                                    ));
+                                    continue;
+                                }
+                            };
+                            if !bytes.is_empty() {
+                                had_writes_or_connects = true;
+                                had_uplink = true;
+                                let _ = inner.socket.send(&bytes).await;
+                            }
+                        }
+                    }
+                    // last_active is bumped only on real activity:
+                    // outbound here, or inbound in udp_reader_task.
+                    // Empty long-poll batches must not refresh it, else
+                    // the idle reaper never fires.
+                    if had_uplink {
+                        *inner.last_active.lock().await = Instant::now();
+                    }
+                    udp_drains.push((i, sid));
+                } else {
+                    results.push((i, eof_response(sid)));
                 }
             }
             "close" => {
@@ -511,58 +736,64 @@ async fn handle_batch(
         }
     }
 
-    // Await all concurrent connect / connect_data jobs. For connect_data,
-    // successful ones join the data-drain set in phase 2; plain connects
-    // go straight to results because they have no initial data to drain.
+    // Await all concurrent connect / connect_data / udp_open jobs.
+    // Successful drain-bearing ones join the appropriate drain list;
+    // plain connects go straight to results.
     while let Some(join) = new_conn_jobs.join_next().await {
         match join {
             Ok((i, NewConn::Connect(r))) => results.push((i, r)),
-            Ok((i, NewConn::ConnectData(Ok(sid)))) => data_ops.push((i, sid)),
+            Ok((i, NewConn::ConnectData(Ok(sid)))) => tcp_drains.push((i, sid)),
             Ok((i, NewConn::ConnectData(Err(r)))) => results.push((i, r)),
+            Ok((i, NewConn::UdpOpen(Ok(sid)))) => udp_drains.push((i, sid)),
+            Ok((i, NewConn::UdpOpen(Err(r)))) => results.push((i, r)),
             Err(e) => {
                 tracing::error!("new-connection task panicked: {}", e);
             }
         }
     }
 
-    // Phase 2: signal-driven wait for any session to have data (or hit
-    // EOF), then drain everyone in a single pass. The deadline is
-    // adaptive:
-    //   * `ACTIVE_DRAIN_DEADLINE` (~350 ms) when the batch had real work
-    //     — typical responses arrive in ms and `wait_for_any_drainable`
-    //     returns on the first notify. After the first wake we settle
-    //     for `STRAGGLER_SETTLE` so neighboring sessions whose replies
-    //     land just behind the first one don't get reported empty.
-    //   * `LONGPOLL_DEADLINE` when the batch is a pure poll — no writes,
-    //     no new connections. The response is held open until upstream
-    //     pushes data, turning idle sessions into a true long-poll
-    //     without paying per-poll latency. No straggler settle here:
-    //     the wake event IS the data the client wants, so deliver it
-    //     immediately.
-    if !data_ops.is_empty() {
+    // Phase 2: signal-driven wait for any session (TCP or UDP) to have
+    // data, then drain TCP and UDP independently in a single pass each.
+    // Deadlines:
+    //   * `ACTIVE_DRAIN_DEADLINE` (~350 ms) when the batch had real work.
+    //     Typical responses arrive in ms; the wait helpers return on
+    //     the first notify. For active batches we settle for
+    //     `STRAGGLER_SETTLE` so neighbors whose replies trail by a few
+    //     ms aren't reported empty.
+    //   * `LONGPOLL_DEADLINE` for pure-poll batches — held open until
+    //     upstream pushes data. UDP idle polls benefit from this just
+    //     as much as TCP, so the same window applies.
+    if !tcp_drains.is_empty() || !udp_drains.is_empty() {
         let deadline = if had_writes_or_connects {
             ACTIVE_DRAIN_DEADLINE
         } else {
             LONGPOLL_DEADLINE
         };
 
-        // Snapshot SessionInner Arcs under a single lock so we don't
-        // hold the sessions-map lock across the await.
-        let inners: Vec<Arc<SessionInner>> = {
+        let tcp_inners: Vec<Arc<SessionInner>> = {
             let sessions = state.sessions.lock().await;
-            data_ops
+            tcp_drains
+                .iter()
+                .filter_map(|(_, sid)| sessions.get(sid).map(|s| s.inner.clone()))
+                .collect()
+        };
+        let udp_inners: Vec<Arc<UdpSessionInner>> = {
+            let sessions = state.udp_sessions.lock().await;
+            udp_drains
                 .iter()
                 .filter_map(|(_, sid)| sessions.get(sid).map(|s| s.inner.clone()))
                 .collect()
         };
 
         let wait_start = Instant::now();
-        wait_for_any_drainable(&inners, deadline).await;
+        // Wait for either side to wake. Running both concurrently means
+        // a TCP-only batch isn't slowed by a stale UDP watch list, and
+        // vice versa.
+        tokio::join!(
+            wait_for_any_drainable(&tcp_inners, deadline),
+            wait_for_any_udp_drainable(&udp_inners, deadline),
+        );
 
-        // Straggler settle: only for active batches, only if we woke
-        // early (didn't hit the deadline). Capped by the remaining
-        // deadline budget — `saturating_sub` so a future refactor that
-        // ever lets `elapsed > deadline` slip through can't underflow.
         if had_writes_or_connects {
             let remaining = deadline.saturating_sub(wait_start.elapsed());
             if !remaining.is_zero() {
@@ -570,34 +801,42 @@ async fn handle_batch(
             }
         }
 
-        // Single drain pass for all sessions in this batch.
-        {
+        // ---- TCP drain ----
+        if !tcp_drains.is_empty() {
             let sessions = state.sessions.lock().await;
-            for (i, sid) in &data_ops {
+            for (i, sid) in &tcp_drains {
                 if let Some(session) = sessions.get(sid) {
                     let (data, eof) = drain_now(&session.inner).await;
-                    results.push((*i, TunnelResponse {
-                        sid: Some(sid.clone()),
-                        d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
-                        eof: Some(eof), e: None, code: None,
-                    }));
+                    results.push((*i, tcp_drain_response(sid.clone(), data, eof)));
                 } else {
-                    results.push((*i, TunnelResponse {
-                        sid: Some(sid.clone()), d: None, eof: Some(true), e: None, code: None,
-                    }));
+                    results.push((*i, eof_response(sid.clone())));
+                }
+            }
+            drop(sessions);
+
+            // Clean up eof TCP sessions.
+            let mut sessions = state.sessions.lock().await;
+            for (_, sid) in &tcp_drains {
+                if let Some(s) = sessions.get(sid) {
+                    if s.inner.eof.load(Ordering::Acquire) {
+                        if let Some(s) = sessions.remove(sid) {
+                            s.reader_handle.abort();
+                            tracing::info!("session {} closed by remote (batch)", sid);
+                        }
+                    }
                 }
             }
         }
 
-        // Clean up eof sessions
-        let mut sessions = state.sessions.lock().await;
-        for (_, sid) in &data_ops {
-            if let Some(s) = sessions.get(sid) {
-                if s.inner.eof.load(Ordering::Acquire) {
-                    if let Some(s) = sessions.remove(sid) {
-                        s.reader_handle.abort();
-                        tracing::info!("session {} closed by remote (batch)", sid);
-                    }
+        // ---- UDP drain ----
+        if !udp_drains.is_empty() {
+            let sessions = state.udp_sessions.lock().await;
+            for (i, sid) in &udp_drains {
+                if let Some(session) = sessions.get(sid) {
+                    let packets = drain_udp_now(&session.inner).await;
+                    results.push((*i, udp_drain_response(sid.clone(), packets)));
+                } else {
+                    results.push((*i, eof_response(sid.clone())));
                 }
             }
         }
@@ -611,6 +850,44 @@ async fn handle_batch(
 
     let json = serde_json::to_vec(&batch_resp).unwrap_or_default();
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json)
+}
+
+fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
+    TunnelResponse {
+        sid: Some(sid),
+        d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
+        pkts: None,
+        eof: Some(eof),
+        e: None,
+        code: None,
+    }
+}
+
+fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>) -> TunnelResponse {
+    let pkts = if packets.is_empty() {
+        None
+    } else {
+        Some(packets.iter().map(|p| B64.encode(p)).collect())
+    };
+    TunnelResponse {
+        sid: Some(sid),
+        d: None,
+        pkts,
+        eof: Some(false),
+        e: None,
+        code: None,
+    }
+}
+
+fn eof_response(sid: String) -> TunnelResponse {
+    TunnelResponse {
+        sid: Some(sid),
+        d: None,
+        pkts: None,
+        eof: Some(true),
+        e: None,
+        code: None,
+    }
 }
 
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -652,7 +929,7 @@ async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16
     let sid = uuid::Uuid::new_v4().to_string();
     tracing::info!("session {} -> {}:{}", sid, host, port);
     state.sessions.lock().await.insert(sid.clone(), session);
-    TunnelResponse { sid: Some(sid), d: None, eof: Some(false), e: None, code: None }
+    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(false), e: None, code: None }
 }
 
 /// Open a session and write the client's first bytes in one round trip.
@@ -704,6 +981,47 @@ async fn handle_connect_data_phase1(
     Ok((sid, inner))
 }
 
+/// UDP analogue of `handle_connect_data_phase1`. Opens a connected UDP
+/// socket to `(host, port)` and optionally sends the client's first
+/// datagram in the same op so a request-response flow (e.g. DNS, STUN)
+/// saves a round trip on session establishment.
+async fn handle_udp_open_phase1(
+    state: &AppState,
+    host: Option<String>,
+    port: Option<u16>,
+    data: Option<String>,
+) -> Result<(String, Arc<UdpSessionInner>), TunnelResponse> {
+    let (host, port) = validate_host_port(host, port)?;
+
+    let session = create_udp_session(&host, port)
+        .await
+        .map_err(|e| TunnelResponse::error(format!("udp connect failed: {}", e)))?;
+
+    if let Some(ref data_b64) = data {
+        if !data_b64.is_empty() {
+            let bytes = match B64.decode(data_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    session.reader_handle.abort();
+                    return Err(TunnelResponse::error(format!("bad base64: {}", e)));
+                }
+            };
+            if !bytes.is_empty() {
+                if let Err(e) = session.inner.socket.send(&bytes).await {
+                    session.reader_handle.abort();
+                    return Err(TunnelResponse::error(format!("udp write failed: {}", e)));
+                }
+            }
+        }
+    }
+
+    let inner = session.inner.clone();
+    let sid = uuid::Uuid::new_v4().to_string();
+    tracing::info!("udp session {} -> {}:{}", sid, host, port);
+    state.udp_sessions.lock().await.insert(sid.clone(), session);
+    Ok((sid, inner))
+}
+
 async fn handle_connect_data_single(
     state: &AppState,
     host: Option<String>,
@@ -724,6 +1042,7 @@ async fn handle_connect_data_single(
     TunnelResponse {
         sid: Some(sid),
         d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
+        pkts: None,
         eof: Some(eof),
         e: None,
         code: None,
@@ -767,6 +1086,7 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
     TunnelResponse {
         sid: Some(sid),
         d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
+        pkts: None,
         eof: Some(eof), e: None, code: None,
     }
 }
@@ -780,35 +1100,73 @@ async fn handle_close(state: &AppState, sid: Option<String>) -> TunnelResponse {
         s.reader_handle.abort();
         tracing::info!("session {} closed by client", sid);
     }
-    TunnelResponse { sid: Some(sid), d: None, eof: Some(true), e: None, code: None }
+    if let Some(s) = state.udp_sessions.lock().await.remove(&sid) {
+        s.reader_handle.abort();
+        tracing::info!("udp session {} closed by client", sid);
+    }
+    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(true), e: None, code: None }
 }
 
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 
-async fn cleanup_task(sessions: Arc<Mutex<HashMap<String, ManagedSession>>>) {
+async fn cleanup_task(
+    sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
+    udp_sessions: Arc<Mutex<HashMap<String, ManagedUdpSession>>>,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        let mut map = sessions.lock().await;
         let now = Instant::now();
-        let mut stale = Vec::new();
-        for (k, s) in map.iter() {
-            let last = *s.inner.last_active.lock().await;
-            if now.duration_since(last) > Duration::from_secs(300) {
-                stale.push(k.clone());
+
+        {
+            let mut map = sessions.lock().await;
+            let mut stale = Vec::new();
+            for (k, s) in map.iter() {
+                let last = *s.inner.last_active.lock().await;
+                if now.duration_since(last) > Duration::from_secs(300) {
+                    stale.push(k.clone());
+                }
+            }
+            for k in &stale {
+                if let Some(s) = map.remove(k) {
+                    s.reader_handle.abort();
+                    tracing::info!("reaped idle session {}", k);
+                }
+            }
+            if !stale.is_empty() {
+                tracing::info!("cleanup: reaped {}, {} active", stale.len(), map.len());
             }
         }
-        for k in &stale {
-            if let Some(s) = map.remove(k) {
-                s.reader_handle.abort();
-                tracing::info!("reaped idle session {}", k);
+
+        {
+            // UDP sessions get a tighter idle window because UDP flows
+            // are typically short-lived (DNS, STUN, single-RTT QUIC) or
+            // make their own keepalives. 120 s avoids leaking sockets
+            // for one-shot lookups while keeping calls/streams alive.
+            let mut map = udp_sessions.lock().await;
+            let mut stale = Vec::new();
+            for (k, s) in map.iter() {
+                let last = *s.inner.last_active.lock().await;
+                if now.duration_since(last) > Duration::from_secs(120) {
+                    stale.push(k.clone());
+                }
             }
-        }
-        if !stale.is_empty() {
-            tracing::info!("cleanup: reaped {}, {} active", stale.len(), map.len());
+            for k in &stale {
+                if let Some(s) = map.remove(k) {
+                    s.reader_handle.abort();
+                    tracing::info!("reaped idle udp session {}", k);
+                }
+            }
+            if !stale.is_empty() {
+                tracing::info!(
+                    "cleanup: reaped {}, {} active udp",
+                    stale.len(),
+                    map.len()
+                );
+            }
         }
     }
 }
@@ -837,9 +1195,11 @@ async fn main() {
 
     let sessions: Arc<Mutex<HashMap<String, ManagedSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    tokio::spawn(cleanup_task(sessions.clone()));
+    let udp_sessions: Arc<Mutex<HashMap<String, ManagedUdpSession>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(cleanup_task(sessions.clone(), udp_sessions.clone()));
 
-    let state = AppState { sessions, auth_key };
+    let state = AppState { sessions, udp_sessions, auth_key };
 
     let app = Router::new()
         .route("/tunnel", post(handle_tunnel))
@@ -872,8 +1232,23 @@ mod tests {
     fn fresh_state() -> AppState {
         AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             auth_key: "test-key".into(),
         }
+    }
+
+    async fn start_udp_echo_server() -> u16 {
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            if let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let mut out = b"ECHO: ".to_vec();
+                out.extend_from_slice(&buf[..n]);
+                let _ = socket.send_to(&out, peer).await;
+            }
+        });
+        port
     }
 
     /// Spin up a one-shot TCP server that echoes everything it reads back
@@ -1370,5 +1745,130 @@ mod tests {
             .expect("Some(\"\") payload should have engaged long-poll and delivered DELAYED");
         let data = B64.decode(d_b64).unwrap();
         assert_eq!(&data[..], b"DELAYED");
+    }
+
+    // ---------------------------------------------------------------------
+    // UDP path
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn udp_open_writes_initial_datagram_and_buffers_reply() {
+        let port = start_udp_echo_server().await;
+        let state = fresh_state();
+
+        let (sid, inner) = handle_udp_open_phase1(
+            &state,
+            Some("127.0.0.1".into()),
+            Some(port),
+            Some(B64.encode(b"ping")),
+        )
+        .await
+        .expect("udp open should succeed");
+
+        assert!(state.udp_sessions.lock().await.contains_key(&sid));
+        wait_for_any_udp_drainable(std::slice::from_ref(&inner), Duration::from_secs(2)).await;
+        let packets = drain_udp_now(&inner).await;
+        assert_eq!(packets, vec![b"ECHO: ping".to_vec()]);
+    }
+
+    /// When the upstream sends faster than the relay drains, the queue
+    /// must drop oldest packets (so recent voice/video stays current)
+    /// AND increment the counter so operators can correlate user
+    /// reports of choppiness with relay backpressure.
+    #[tokio::test]
+    async fn udp_queue_overflow_drops_oldest_and_counts() {
+        let state = fresh_state();
+        let sink = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let sink_port = sink.local_addr().unwrap().port();
+
+        let (_sid, inner) =
+            handle_udp_open_phase1(&state, Some("127.0.0.1".into()), Some(sink_port), None)
+                .await
+                .expect("udp open");
+
+        // Flood the session socket from sink — its connected remote is
+        // exactly sink_port, so packets pass the kernel's source check.
+        let session_addr = inner.socket.local_addr().unwrap();
+        let burst = UDP_QUEUE_LIMIT + 16;
+        for i in 0..burst {
+            let payload = format!("p{}", i).into_bytes();
+            sink.send_to(&payload, session_addr).await.unwrap();
+        }
+        // Give the reader_task a chance to drain the OS buffer.
+        for _ in 0..50 {
+            if inner.queue_drops.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let drops = inner.queue_drops.load(Ordering::Relaxed);
+        let queued = inner.packets.lock().await.len();
+        assert!(drops >= 1, "expected ≥1 drop, got {} (queued={})", drops, queued);
+        assert!(queued <= UDP_QUEUE_LIMIT, "queue exceeded limit: {}", queued);
+    }
+
+    /// Regression for the bug the review caught: a batch mixing UDP and
+    /// TCP-data ops must let the TCP side benefit from the same
+    /// event-driven drain. With the new architecture both sides share
+    /// one wait_start / deadline window — ensure a delayed TCP response
+    /// still makes it into the batch even when UDP is along for the ride.
+    #[tokio::test]
+    async fn tcp_drain_runs_when_batch_also_contains_udp() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        // TCP server that delays its response past the typical wake but
+        // well within ACTIVE_DRAIN_DEADLINE (350ms).
+        let tcp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = tcp_listener.accept().await {
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let _ = sock.write_all(b"DELAYED").await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        // Idle UDP target — never replies. Just sets up the dual-drain
+        // path through Phase 2.
+        let udp_target = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let udp_port = udp_target.local_addr().unwrap().port();
+
+        let state = fresh_state();
+        let tcp_sid = match handle_connect(&state, Some("127.0.0.1".into()), Some(tcp_port)).await {
+            TunnelResponse {
+                sid: Some(s),
+                e: None,
+                ..
+            } => s,
+            other => panic!("connect failed: {:?}", other),
+        };
+        let (udp_sid, _udp_inner) =
+            handle_udp_open_phase1(&state, Some("127.0.0.1".into()), Some(udp_port), None)
+                .await
+                .expect("udp open");
+
+        let body = serde_json::json!({
+            "k": "test-key",
+            "ops": [
+                {"op": "data", "sid": tcp_sid, "d": B64.encode(b"hello")},
+                {"op": "udp_data", "sid": udp_sid},
+            ]
+        })
+        .to_string();
+        let resp = handle_batch(State(state.clone()), Bytes::from(body))
+            .await
+            .into_response();
+        let (parts, body) = resp.into_parts();
+        assert_eq!(parts.status, axum::http::StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let r = parsed["r"].as_array().unwrap();
+        assert_eq!(r.len(), 2);
+        let tcp_d = r[0]["d"].as_str().expect("tcp data missing");
+        let decoded = B64.decode(tcp_d).unwrap();
+        assert_eq!(&decoded[..], b"DELAYED");
     }
 }

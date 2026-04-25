@@ -267,7 +267,7 @@ HTTP/HTTPS continues to route through the Apps Script relay (no change), and the
 
 ## Full tunnel mode
 
-Full tunnel mode (`"mode": "full"`) routes **all** traffic end-to-end through Apps Script and a remote [tunnel-node](tunnel-node/) — no MITM certificate needed. The trade-off is higher latency per request (every byte goes Apps Script → tunnel-node → destination), but it works for every protocol and every app without CA installation.
+Full tunnel mode (`"mode": "full"`) routes **all** traffic end-to-end through Apps Script and a remote [tunnel-node](tunnel-node/) — no MITM certificate needed. TCP is carried as persistent tunnel sessions, and UDP from Android/TUN clients is carried via SOCKS5 `UDP ASSOCIATE` to the tunnel-node, which then emits real UDP from the server side. The trade-off is higher latency per request (every byte/datagram goes Apps Script → tunnel-node → destination), but it works for protocols and apps that cannot use the MITM relay path.
 
 ### How deployment IDs affect performance
 

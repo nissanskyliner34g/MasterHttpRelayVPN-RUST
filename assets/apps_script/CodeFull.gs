@@ -6,6 +6,8 @@
  *   2. Batch relay:   POST { k, q: [{m,u,h,b,ct,r}, ...] }    → { q: [{s,h,b}, ...] }
  *   3. Tunnel:        POST { k, t, h, p, sid, d }              → { sid, d, eof }
  *   4. Tunnel batch:  POST { k, t:"batch", ops:[...] }         → { r: [...] }
+ *      Batch ops include TCP (`connect`, `data`) and UDP (`udp_open`,
+ *      `udp_data`) tunnel-node operations.
  *
  * CHANGE THESE TO YOUR OWN VALUES!
  */

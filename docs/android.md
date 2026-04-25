@@ -221,9 +221,9 @@ Cloudflare's `cf_clearance` cookie is bound to the `(IP, UA, JA3)` tuple the cha
 
 **Sites that only gate the first page load** (most of CF's Bot Fight Mode customers) work fine after one solve. Sites that challenge every request (crypto exchanges, adult, some forums) fundamentally can't hold a session through this architecture — use a different tunnel for those.
 
-### UDP / QUIC (HTTP/3) doesn't go through
+### UDP / QUIC (HTTP/3)
 
-The SOCKS5 listener only handles `CONNECT`, not `UDP ASSOCIATE`. Chrome tries HTTP/3 first and falls back to HTTP/2 over TCP, which works fine. Effect: slightly slower first connect, everything else normal.
+In `full` mode, the SOCKS5 listener handles `UDP ASSOCIATE` and tunnels UDP datagrams through Apps Script to `tunnel-node`, which then sends real UDP to the destination. Your ISP still only sees HTTPS to Google. In `apps_script` mode, UDP still falls back the old way: Chrome tries HTTP/3 first and then uses HTTP/2 over TCP.
 
 ### IPv6 leaks
 

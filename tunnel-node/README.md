@@ -8,10 +8,12 @@ HTTP tunnel bridge server for MasterHttpRelayVPN "full" mode. Bridges HTTP tunne
 Phone → mhrv-rs → [domain-fronted TLS] → Apps Script → [HTTP] → Tunnel Node → [real TCP] → Internet
 ```
 
-The tunnel node manages persistent TCP sessions. Each session is a real TCP connection to a destination server. Data flows through a JSON protocol:
+The tunnel node manages persistent TCP and UDP sessions. TCP sessions are real TCP connections to a destination server; UDP sessions are connected UDP sockets to one destination host:port. Data flows through a JSON protocol:
 
 - **connect** — open TCP to host:port, return session ID
 - **data** — write client data, return server response
+- **udp_open** — open UDP to host:port, optionally send the first datagram
+- **udp_data** — send one UDP datagram, or poll for returned datagrams when `d` is omitted
 - **close** — tear down session
 - **batch** — process multiple ops in one HTTP request (reduces round trips)
 
@@ -108,7 +110,7 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
   "k": "auth",
   "ops": [
     {"op":"data","sid":"uuid1","d":"base64"},
-    {"op":"data","sid":"uuid2","d":"base64"},
+    {"op":"udp_data","sid":"uuid2","d":"base64"},
     {"op":"close","sid":"uuid3"}
   ]
 }
