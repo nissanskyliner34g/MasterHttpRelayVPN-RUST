@@ -765,24 +765,39 @@ impl DomainFronter {
             match chunk {
                 Ok(chunk) => full.extend_from_slice(&chunk),
                 Err(reason) => {
+                    // Issue #162: silently rewriting the probe to a 200
+                    // here truncates the response to whatever the probe
+                    // saw (typically 256 KiB — the chunk size). Browsers
+                    // see HTTP 200 + Content-Length=262144 and treat
+                    // the download as complete; users reported "every
+                    // file capped at 256 KB" because every download
+                    // that hit this failure path landed there. Common
+                    // triggers: Apps Script stripping Content-Range,
+                    // origin returning 200-instead-of-206 on later
+                    // chunks, total mismatch across chunks. Correct
+                    // recovery is a fresh single GET — Apps Script
+                    // fetches the full URL up to its 50 MiB cap. Slow
+                    // for big files vs. the parallel path but produces
+                    // a complete response, which is what matters.
                     tracing::warn!(
-                        "range-parallel: invalid chunk {}-{} for {} ({}); falling back to probe response",
-                        start,
-                        end,
-                        url,
-                        reason,
+                        "range-parallel: invalid chunk {}-{} for {} ({}); falling back to single GET",
+                        start, end, url, reason,
                     );
-                    return rewrite_206_to_200(&first);
+                    return self.relay(method, url, headers, body).await;
                 }
             }
         }
 
         if (full.len() as u64) != total {
+            // Same fallback rationale as the chunk-validation case
+            // above: returning the probe truncates to 256 KiB. Single
+            // GET is the only way to give the user a complete file
+            // when the parallel stitch can't be trusted.
             tracing::warn!(
-                "range-parallel: stitched {}/{} bytes for {}; falling back to probe response",
+                "range-parallel: stitched {}/{} bytes for {}; falling back to single GET",
                 full.len(), total, url,
             );
-            return rewrite_206_to_200(&first);
+            return self.relay(method, url, headers, body).await;
         }
 
         // Build a 200 OK with Content-Length = full body length. Drop
