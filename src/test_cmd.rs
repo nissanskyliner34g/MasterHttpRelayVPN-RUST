@@ -28,6 +28,28 @@ pub async fn run(config: &Config) -> bool {
         tracing::error!("{}", msg);
         return false;
     }
+    if matches!(config.mode_kind(), Ok(Mode::Full)) {
+        // Issue #160: Test Relay used to silently fall through to the
+        // apps_script path here, which made it look like the user's
+        // tunnel-node was being used when it wasn't. The probed IP came
+        // back as the Apps Script datacenter — confusing because it
+        // disagreed with what whatismyipaddress.com showed in the
+        // browser (which DOES go through the tunnel). Rather than fake
+        // a passing test, refuse the same way we do for google_only and
+        // tell the user how to actually verify Full mode.
+        let msg = "`mhrv-rs test` is wired only for the apps_script relay \
+                   path. In full mode the data plane is the pipelined \
+                   tunnel mux talking to your tunnel-node — Test Relay \
+                   would bypass that and probe Apps Script directly, \
+                   which is misleading. To verify full mode end-to-end, \
+                   start the proxy and load https://whatismyipaddress.com \
+                   in your browser via 127.0.0.1:8085 (HTTP) or :8086 \
+                   (SOCKS5) — the IP shown should be your tunnel-node's \
+                   VPS IP. Tracking a real Full-mode test in #160.";
+        println!("{}", msg);
+        tracing::error!("{}", msg);
+        return false;
+    }
     let fronter = match DomainFronter::new(config) {
         Ok(f) => f,
         Err(e) => {
