@@ -163,6 +163,33 @@ pub struct Config {
     /// Issues #39, #127.
     #[serde(default)]
     pub passthrough_hosts: Vec<String>,
+
+    /// Block outbound QUIC (UDP/443) at the SOCKS5 listener.
+    ///
+    /// QUIC is HTTP/3-over-UDP. In `apps_script` mode it's hopeless —
+    /// Apps Script is HTTP-only, so QUIC datagrams either get refused
+    /// outright (UDP ASSOCIATE rejected) or silently fall through to
+    /// `raw-tcp direct` and fail in interesting ways. In `full` mode
+    /// the tunnel-node CAN carry UDP, but QUIC's congestion control
+    /// stacked on top of TCP-encapsulated transport produces TCP
+    /// meltdown for any non-trivial bandwidth — browsers see <1 Mbps
+    /// where the same site over plain HTTPS would do >50.
+    ///
+    /// With `block_quic = true`, the SOCKS5 UDP relay drops any
+    /// datagram destined for port 443 (silent UDP — caller's stack
+    /// retries a few times then falls back). Browsers then re-issue
+    /// the same request as TCP/HTTPS through the regular CONNECT
+    /// path, which goes through the relay normally.
+    ///
+    /// Why this is opt-in rather than always-on: for users on Full
+    /// mode + udpgw (a recent path; v1.7.0+) the QUIC TCP-meltdown
+    /// is partially mitigated by udpgw's persistent-socket reuse,
+    /// and a tiny minority of sites only support HTTP/3 (rare). The
+    /// flag lets users who care about consistency over peak speed
+    /// opt out of QUIC at the source rather than discovering its
+    /// failure modes later. Issue #213.
+    #[serde(default)]
+    pub block_quic: bool,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }

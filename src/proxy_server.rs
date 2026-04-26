@@ -195,6 +195,10 @@ pub struct RewriteCtx {
     /// and pass through as plain TCP (optionally via upstream_socks5).
     /// See config.rs `passthrough_hosts` for matching rules. Issues #39, #127.
     pub passthrough_hosts: Vec<String>,
+    /// If true, drop SOCKS5 UDP datagrams destined for port 443 so
+    /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
+    /// the trade-off. Issue #213.
+    pub block_quic: bool,
 }
 
 /// True if `host` matches any entry in the user's passthrough list.
@@ -263,6 +267,7 @@ impl ProxyServer {
             mode,
             youtube_via_relay: config.youtube_via_relay,
             passthrough_hosts: config.passthrough_hosts.clone(),
+            block_quic: config.block_quic,
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -863,6 +868,30 @@ async fn handle_socks5_udp_associate(
                 let Some((target, payload)) = parse_socks5_udp_packet(&buf[..n]) else {
                     continue;
                 };
+
+                // Issue #213: client-side QUIC block. UDP/443 is
+                // HTTP/3 — drop the datagram silently so the client
+                // stack retries a couple of times and then falls back
+                // to TCP/HTTPS, which goes through the regular CONNECT
+                // path. Skipping this at the SOCKS5 layer (rather than
+                // letting it hit the tunnel-node) avoids paying the
+                // 200–500 ms tunnel-node round-trip per dropped QUIC
+                // datagram, which would otherwise compound during the
+                // 1–3 retries before the browser falls back.
+                //
+                // Silent drop instead of an explicit error reply: the
+                // SOCKS5 UDP wire has no "destination unreachable"
+                // datagram — `0x04` only exists in TCP CONNECT replies
+                // (RFC 1928 §6). The browser's QUIC stack already has
+                // a "no response → fall back" timeout, so silent drop
+                // is the contractually correct shape.
+                if rewrite_ctx.block_quic && target.port == 443 {
+                    tracing::debug!(
+                        "udp dropped: block_quic=true, target {}:443",
+                        target.host
+                    );
+                    continue;
+                }
 
                 // RFC 1928 §6: lock to the first VALID datagram's source
                 // port. Subsequent datagrams must come from the same
