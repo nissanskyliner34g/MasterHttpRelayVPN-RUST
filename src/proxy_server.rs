@@ -47,6 +47,18 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "youtu.be",
     "youtube-nocookie.com",
     "ytimg.com",
+    // YouTube video CDN. Issue #275: a user reported that with
+    // `youtube_via_relay = true`, every video chunk was traversing the
+    // Apps Script relay and a single chunk timeout aborted playback —
+    // because `googlevideo.com` was not on this list, all chunks
+    // fell through to the relay path. Adding it here keeps video
+    // bytes on the direct GFE tunnel even when the relay flag is on
+    // (the YOUTUBE_RELAY_HOSTS carve-out below excludes only the API
+    // / HTML surfaces, not the CDN). The chunks are unauthenticated
+    // bytes anyway — there's no Restricted Mode logic on the CDN, so
+    // routing them through Apps Script gains nothing and costs the
+    // 6-minute Apps Script execution cap on long videos.
+    "googlevideo.com",
     // Google Video Transport CDN — YouTube video chunks, Chrome
     // auto-updates, Google Play Store downloads. The single biggest
     // gap vs the upstream Python port: without these in the list
@@ -72,27 +84,62 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "blogger.com",
 ];
 
-/// YouTube-family suffixes. Extracted so `youtube_via_relay` config can
-/// pull them out of the SNI-rewrite dispatch at runtime.
-const YOUTUBE_SNI_SUFFIXES: &[&str] = &[
+/// YouTube hosts that should be routed through the Apps Script relay
+/// when `youtube_via_relay` is enabled — the API + HTML surfaces where
+/// Restricted Mode is actually enforced (via the SNI=www.google.com
+/// edge looking at the request). Issue #102 / #275.
+///
+/// Deliberately narrower than the YouTube section of
+/// `SNI_REWRITE_SUFFIXES`:
+///   - `youtube.com` / `youtu.be` / `youtube-nocookie.com`: HTML pages
+///     and player frames. These trigger Restricted Mode if served via
+///     the SNI rewrite, so when the flag is on we relay them.
+///   - `youtubei.googleapis.com`: the YouTube data API the player
+///     queries for video metadata + manifest. Restricted Mode also
+///     gates video availability here. Without this entry, the JSON
+///     RPC layer would still hit the SNI-rewrite tunnel via the
+///     broader `googleapis.com` suffix — the user-visible symptom of
+///     that miss is "youtube_via_relay flips on but Restricted Mode
+///     stays sticky on some videos."
+///
+/// **NOT** in this list (intentional, was a regression in #275):
+///   - `ytimg.com`: thumbnails. No Restricted Mode logic on a static
+///     image CDN; routing through Apps Script makes thumbnails slow
+///     for zero gain.
+///   - `googlevideo.com`: video chunk CDN. Routing through Apps Script
+///     means every chunk eats Apps Script quota *and* risks the 6-min
+///     execution cap aborting long videos mid-playback.
+///   - `ggpht.com`: channel/profile images, same reasoning as ytimg.
+const YOUTUBE_RELAY_HOSTS: &[&str] = &[
     "youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
-    "ytimg.com",
+    "youtubei.googleapis.com",
 ];
 
 fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
+
+    // YouTube relay carve-out runs FIRST so it wins over the broad
+    // `googleapis.com` suffix that would otherwise pull
+    // `youtubei.googleapis.com` into the SNI-rewrite path. The earlier
+    // implementation iterated SNI_REWRITE_SUFFIXES with a filter, which
+    // works for sibling entries (e.g. `youtube.com` in both lists) but
+    // not for nested ones (`youtubei.googleapis.com` matches the broad
+    // `googleapis.com` even when its specific entry is filtered out).
+    // The short-circuit here is unconditional — we don't need to check
+    // SNI rewrite once we've decided this host goes to the relay.
+    if youtube_via_relay {
+        for s in YOUTUBE_RELAY_HOSTS {
+            if h == *s || h.ends_with(&format!(".{}", s)) {
+                return false;
+            }
+        }
+    }
+
     SNI_REWRITE_SUFFIXES
         .iter()
-        .filter(|s| {
-            // If the user opted into youtube_via_relay, skip YouTube
-            // suffixes so they fall through to the Apps Script relay
-            // path. See config.rs `youtube_via_relay` docs for the
-            // trade-off. Issue #102.
-            !(youtube_via_relay && YOUTUBE_SNI_SUFFIXES.contains(s))
-        })
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
 }
 
@@ -2587,36 +2634,75 @@ mod tests {
 
     #[test]
     fn youtube_via_relay_routes_youtube_through_relay_path() {
-        // Issue #102. When youtube_via_relay=true, YouTube suffixes
-        // must NOT match the SNI-rewrite path, so traffic falls
-        // through to Apps Script relay. Other Google suffixes are
-        // unaffected.
+        // Issue #102 + #275. When youtube_via_relay=true:
+        //   - YouTube API + HTML hosts (where Restricted Mode lives)
+        //     opt out of SNI rewrite so they go through the relay.
+        //   - YouTube image / video / channel-asset CDNs STAY on SNI
+        //     rewrite — Restricted Mode isn't enforced on those, and
+        //     routing video chunks through Apps Script burns quota
+        //     and risks the 6-min execution cap. Pre-#275 ytimg.com
+        //     was incorrectly carved out alongside the API surfaces.
+        //   - Non-YouTube Google suffixes are unaffected by the flag.
         let hosts = std::collections::HashMap::new();
 
-        // Default behaviour: everything in the pool rewrites.
-        assert!(should_use_sni_rewrite(
-            &hosts,
-            "www.youtube.com",
-            443,
-            false
-        ));
+        // Default behaviour (flag off): everything in the SNI pool
+        // rewrites including all YouTube assets.
+        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "rr1---sn-abc.googlevideo.com",
+            443,
+            false
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "youtubei.googleapis.com",
+            443,
+            false
+        ));
 
-        // With the toggle on: YouTube opts out, Google stays.
+        // Flag on: only the API + HTML hosts opt out.
+        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true));
+        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
         assert!(!should_use_sni_rewrite(
             &hosts,
-            "www.youtube.com",
+            "www.youtube-nocookie.com",
             443,
             true
         ));
-        assert!(!should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
-        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
-        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "youtubei.googleapis.com",
+            443,
+            true
+        ));
+
+        // Flag on: video / image / channel-asset CDNs STAY on SNI
+        // rewrite. The pre-#275 implementation broke playback by
+        // routing googlevideo.com through Apps Script (it wasn't even
+        // in the SNI list before #275, so it always went via relay)
+        // and routed ytimg.com through the relay too.
+        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
         assert!(should_use_sni_rewrite(
             &hosts,
-            "fonts.gstatic.com",
+            "rr1---sn-abc.googlevideo.com",
+            443,
+            true
+        ));
+        assert!(should_use_sni_rewrite(&hosts, "yt3.ggpht.com", 443, true));
+
+        // Flag on: non-YouTube Google suffixes are unaffected. Note
+        // youtubei.googleapis.com (above) is the *carve-out* — the
+        // broader googleapis.com suffix is NOT carved out, so e.g.
+        // Drive / Calendar / etc. continue to SNI-rewrite.
+        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "drive.googleapis.com",
             443,
             true
         ));
