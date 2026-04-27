@@ -112,7 +112,12 @@ jobs:
     # mipsel-softfloat is best-effort: the Rust tier-3 target occasionally
     # regresses. Letting it fail keeps the main release going so
     # desktop/Android users aren't blocked by MT7621 router support.
-    continue-on-error: ${{ matrix.mipsel_softfloat == true }}
+    # i686-pc-windows-msvc is similarly best-effort — pinned to Rust
+    # 1.77.2 for Win7 compat (#318), so a future dep MSRV bump above
+    # 1.77 will fail this one target. Letting it skip keeps the rest
+    # of the release unblocked; we'd then choose between dropping the
+    # target or moving to the tier-3 win7-msvc target with build-std.
+    continue-on-error: ${{ matrix.mipsel_softfloat == true || matrix.target == 'i686-pc-windows-msvc' }}
 
     steps:
       # Heal any root-owned leftovers from a previous mipsel docker
