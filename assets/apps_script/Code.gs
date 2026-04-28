@@ -239,6 +239,15 @@ function _respHeaders(resp) {
   return resp.getHeaders();
 }
 
+function doGet(e) {
+  return HtmlService.createHtmlOutput(
+    "<!DOCTYPE html><html><head><title>My App</title></head>" +
+      '<body style="font-family:sans-serif;max-width:600px;margin:40px auto">' +
+      "<h1>Welcome</h1><p>This application is running normally.</p>" +
+      "</body></html>"
+  );
+}
+
 function _json(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
     ContentService.MimeType.JSON
